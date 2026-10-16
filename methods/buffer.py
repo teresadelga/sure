@@ -1,43 +1,44 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
-from utils.metrics import get_ll
 
-def _seq_to_key(t: torch.Tensor, PAD_ID) -> tuple[int, ...]:
-    """Convert to hashable key after removing pad tokens on either end."""
-    # 1‑D tensor expected here
-    # Drop left & right padding; middle padding cannot appear in causal LM.
-    if PAD_ID is not None:
-        t = t[t != PAD_ID]
-    return tuple(t.tolist())
+SCORE_MAX_TOKENS = 65536
 
-def get_ll(input_ids, labels, model):
+
+def score_sequences(model, sequences, max_tokens=SCORE_MAX_TOKENS):
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    rank, world = (torch.distributed.get_rank(), torch.distributed.get_world_size()) if distributed else (0, 1)
+    if rank == 0:
+        print(f"Scoring {len(sequences)} sequences for the surprise buffer on {world} rank(s)")
+    mine = sorted(range(rank, len(sequences), world), key=lambda k: len(sequences[k]), reverse=True)
+    device = next(model.parameters()).device
+    scores = {}
+    was_training = model.training
+    model.eval()
     with torch.no_grad():
-        # Convert to tensors if not already
-        if not isinstance(input_ids, torch.Tensor):
-            input_ids = torch.tensor(input_ids).unsqueeze(0).to(model.device)
-        if not isinstance(labels, torch.Tensor):
-            labels = torch.tensor(labels).unsqueeze(0).to(model.device)
-
-        sequence_labels = input_ids.clone()
-        sequence_labels[:, 0] = -100  # mask first token
-
-        out = model(input_ids=input_ids, labels=sequence_labels)
-        per_token_nll = out.loss.item()
-
-    return per_token_nll
-
-
-def get_lls(inputs, labels, model, PAD_ID):
-    avg_lls = {}
-    seq_to_labels = {}  # key → original labels
-
-    for input_ids, label in zip(inputs, labels):
-        ll = get_ll(input_ids, label, model)
-        key = _seq_to_key(torch.tensor(input_ids), PAD_ID=PAD_ID)
-        avg_lls[key] = ll
-        seq_to_labels[key] = label  # store actual labels for this key
-
-    return avg_lls, seq_to_labels
+        start = 0
+        while start < len(mine):
+            # Longest first, so the first sequence sets the batch's padded length.
+            width = len(sequences[mine[start]])
+            batch = mine[start:start + max(1, max_tokens // width)]
+            start += len(batch)
+            input_ids = torch.zeros(len(batch), width, dtype=torch.long)
+            attention_mask = torch.zeros(len(batch), width, dtype=torch.long)
+            for r, k in enumerate(batch):
+                input_ids[r, :len(sequences[k])] = torch.as_tensor(sequences[k])
+                attention_mask[r, :len(sequences[k])] = 1
+            input_ids, attention_mask = input_ids.to(device), attention_mask.to(device)
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            for r, k in enumerate(batch):
+                n = len(sequences[k])
+                scores[k] = F.cross_entropy(logits[r, :n - 1].float(), input_ids[r, 1:n]).item() if n > 1 else 0.0
+            del logits
+    model.train(was_training)
+    if distributed:
+        gathered = [None] * world
+        torch.distributed.all_gather_object(gathered, scores)
+        scores = {k: v for part in gathered for k, v in part.items()}
+    return [scores[k] for k in range(len(sequences))]
 
 class Buffer:
     def __init__(self, data_collator, buffer_size=500, device='cuda', type="Reservoir"):
@@ -56,11 +57,17 @@ class Buffer:
         return rand if rand < self.buffer_size else -1
 
 
-    def add_data(self, input_ids, labels, dom, surprise_scores=None):
+    def add_data(self, input_ids, labels, dom, surprise_scores=None, attention_mask=None):
         for i in range(len(input_ids)):
             idx = self.reservoir(self.num_seen_examples) if self.type == 'Reservoir' else 1
-            input_id = input_ids[i].to(self.device)
-            label = labels[i].to(self.device)
+            input_id = input_ids[i].tolist() if torch.is_tensor(input_ids[i]) else list(input_ids[i])
+            label = labels[i].tolist() if torch.is_tensor(labels[i]) else list(labels[i])
+            if attention_mask is not None:
+                keep = attention_mask[i].bool().tolist()
+                input_id = [t for t, k in zip(input_id, keep) if k]
+                if len(label) == len(keep):
+                    label = [t for t, k in zip(label, keep) if k]
+            surprise = surprise_scores[i] if surprise_scores is not None else None
             self.num_seen_examples += 1
 
             if dom not in self.num_examples_per_dom:
@@ -68,27 +75,26 @@ class Buffer:
 
             if idx >= 0:
                 if len(self.buffer) < self.buffer_size:
-                    self.buffer.append((input_id, label, dom))
+                    self.buffer.append((input_id, label, surprise, dom))
                     if dom in self.num_examples_per_dom:
                         self.num_examples_per_dom[dom] += 1
                 else:
                     candidate_idx = np.random.randint(0, len(self.buffer))
                     candidate = self.buffer[candidate_idx]
-                    self.num_examples_per_dom[candidate[2]] -= 1
+                    self.num_examples_per_dom[candidate[3]] -= 1
                     if dom in self.num_examples_per_dom:
                         self.num_examples_per_dom[dom] += 1
-                    self.buffer[candidate_idx] = (input_id, label, surprise_scores, dom)
+                    self.buffer[candidate_idx] = (input_id, label, surprise, dom)
 
     def remove_data(self, input_ids, dom):
-        to_remove = set(ids for ids in input_ids)
+        to_remove = set(tuple(ids) for ids in input_ids)
         new_buffer = []
         actually_removed = 0  # Count what we actually remove
 
         for sample in self.buffer:
             if sample is None:
                 continue
-            input_ids_tuple = tuple(sample[0].cpu().tolist())
-            if sample[0] in to_remove:
+            if tuple(sample[0]) in to_remove:
                 actually_removed += 1  # Increment actual count
                 del sample
             else:
@@ -103,8 +109,8 @@ class Buffer:
         if not self.buffer:
             return None
         indices = np.random.choice(len(self.buffer), size=min(size, len(self.buffer)), replace=False)
-        inputs, labels, _ = zip(*[self.buffer[i] for i in indices])
-        return torch.stack(inputs), torch.stack(labels)
+        features = [{"input_ids": self.buffer[i][0], "labels": self.buffer[i][1]} for i in indices]
+        return self.data_collator(features)
 
     def is_empty(self):
         return len(self.buffer) == 0
@@ -125,17 +131,10 @@ class Buffer:
                     print(f'Length of delete_data: {len([x[0] for x in curr_domain[:num_to_remove]])}')
                     self.remove_data([x[0] for x in curr_domain[:num_to_remove]], dom=j)
 
-            if  self.is_empty() or (j == i and i < 14 and update_buffer=="after") or (j == (i+1) and i < 14 and update_buffer=="before"):
-        
-                lls, seq_to_labels = get_lls(
-                    train_datasets[j]['input_ids'],
-                    train_datasets[j]["labels"],
-                    model,
-                    PAD_ID=tokenizer.pad_token_id
-                )
-
-                surprise = sorted(lls.items(), key=lambda x: x[1], reverse=True)
-                if self.is_empty:
+            if (j == i and i < 14 and update_buffer=="after") or (j == (i+1) and i < 14 and update_buffer=="before"):
+                inputs, labels = train_datasets[j]["input_ids"], train_datasets[j]["labels"]
+                scores = score_sequences(model, inputs)
+                if self.is_empty():
                     num_to_add = self.buffer_size
                 elif update_buffer == "before":
                     num_to_add = self.buffer_size // (i + 2) 
@@ -144,14 +143,19 @@ class Buffer:
                 input_ids_batch = []
                 labels_batch = []
                 surprise_scores_batch = []
+                seen = set()
 
-                for k, score in surprise[:num_to_add]:
-                    ids = list(k)
-                    if ids[-1] != tokenizer.eos_token_id:
-                        ids.append(tokenizer.eos_token_id)
-                    input_ids_batch.append(torch.tensor(ids, dtype=torch.long))
-                    labels_batch.append(torch.tensor(seq_to_labels[k], dtype=torch.long))  # correct label sequence
-                    surprise_scores_batch.append(score)
+                # Most surprising first, skipping duplicate sequences.
+                for k in sorted(range(len(scores)), key=lambda k: scores[k], reverse=True):
+                    if len(input_ids_batch) == num_to_add:
+                        break
+                    key = tuple(inputs[k])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    input_ids_batch.append(list(inputs[k]))
+                    labels_batch.append(list(labels[k]))
+                    surprise_scores_batch.append(scores[k])
 
                 self.add_data(
                     input_ids_batch,

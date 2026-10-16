@@ -1,62 +1,61 @@
-from transformers import Trainer
+from contextlib import contextmanager
 import torch
-import numpy as np
+from transformers import TrainerCallback
+from methods.replay import ReplayTrainer
 
-class DualLearnerTrainer(Trainer):
-    def __init__(self, *args, slow_model=None, buffer=None, domain=None, lambda_ema=0.99, replay_frequency=2, update_buffer='online', **kwargs):
+
+class _SlowUpdateCallback(TrainerCallback):
+    """Updates the slow weights after each optimizer step, so the EMA horizon is in optimizer steps
+    and does not depend on the number of GPUs or gradient accumulation steps."""
+
+    def __init__(self, trainer):
+        self.trainer = trainer
+
+    def on_step_end(self, args, state, control, **kwargs):
+        trainer = self.trainer
+        if trainer.slow_weights is not None:
+            trainer.update_slow_model(trainer.accelerator.unwrap_model(trainer.model))
+
+
+class DualLearnerTrainer(ReplayTrainer):
+    """ReplayTrainer (the fast learner) plus slow learners."""
+
+    def __init__(self, *args, slow_weights=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.slow_model = slow_model
-        self.buffer = buffer
-        self.lambda_ema = lambda_ema
-        self.domain = domain
-        self._micro_step = 0
-        self.replay_frequency = replay_frequency
-        self.update_buffer = update_buffer
+        self.slow_weights = slow_weights
+        self.add_callback(_SlowUpdateCallback(self))
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        outputs = model(**inputs)
-        batch_size = inputs["input_ids"].shape[0]
+    def init_slow_weights(self, model, lambdas, debias=True):
+        self.slow_init = {n: p.detach().float().clone() for n, p in model.named_parameters() if p.requires_grad}
+        self.slow_weights = {lam: {n: torch.zeros_like(w) for n, w in self.slow_init.items()} for lam in lambdas}
+        self.slow_debias = debias
+        self.slow_steps = 0
 
-        if self.update_buffer == "online" and self.buffer is not None:
-            self.buffer.add_data(inputs["input_ids"], inputs["labels"], self.domain)
+    @staticmethod
+    def learner_name(lam, lambdas):
+        return "slow" if len(lambdas) == 1 else f"slow@{lam:g}"
 
-
-        self._micro_step += 1
-        do_replay = (self._micro_step % self.replay_frequency == 0)
-
-        # ---- Replay memory (half-size batch) ----
-        if do_replay and self.buffer and not self.buffer.is_empty():
-            #print("replayed")
-            buffer_sample_size = max(1, self.args.per_device_train_batch_size)
-            # get a collated batch dict (CPU tensors)
-            buffer_batch = self.buffer.get_data(size=buffer_sample_size)
-            # move to device since we're calling the model directly
-            buffer_batch = {k: v.to(model.device) for k, v in buffer_batch.items()}
-            replay_outputs = model(**buffer_batch)
-            loss = (outputs.loss + replay_outputs.loss) / 2
-        else:
-            loss = outputs.loss
-
-        return (loss, outputs) if return_outputs else loss
-
-    def training_step(
-        self,
-        model,
-        inputs,
-        num_items_in_batch: int = None,          # <— add this
-    ):
-        # Delegate to the original Trainer.training_step
-        loss = super().training_step(model, inputs, num_items_in_batch)
-
-        # Update slow weights (EMA) and buffer
-        self.update_slow_model(model)
-
-        return loss
-
+    @torch.no_grad()
     def update_slow_model(self, fast_model):
-        current_step = self.state.global_step
-        fast_param = fast_model.parameters()
+        self.slow_steps += 1
+        for n, p_fast in fast_model.named_parameters():
+            if n in self.slow_init:
+                delta = p_fast.detach().float() - self.slow_init[n]
+                for lam, weights in self.slow_weights.items():
+                    weights[n].mul_(lam).add_(delta, alpha=1 - lam)
 
-        for p_slow, p_fast in zip(self.slow_model.parameters(), fast_param):
-            p_slow.data = self.lambda_ema * p_slow.data + (1 - self.lambda_ema) * p_fast.data
-
+    @contextmanager
+    def use_slow_weights(self, model, lam):
+        """Temporarily load the slow weights for lambda_ema=lam for evaluation."""
+        correction = 1 - lam ** self.slow_steps if self.slow_debias and self.slow_steps > 0 else 1
+        params = dict(model.named_parameters())
+        fast = {n: params[n].detach().clone() for n in self.slow_init}
+        with torch.no_grad():
+            for n, delta in self.slow_weights[lam].items():
+                params[n].copy_(self.slow_init[n] + delta / correction)
+        try:
+            yield model
+        finally:
+            with torch.no_grad():
+                for n, w in fast.items():
+                    params[n].copy_(w)

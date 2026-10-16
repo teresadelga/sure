@@ -1,6 +1,4 @@
 from transformers import Trainer
-import numpy as np
-import torch
 
 
 class ReplayTrainer(Trainer):
@@ -11,28 +9,34 @@ class ReplayTrainer(Trainer):
         self._micro_step = 0  # counts forward passes
         self.replay_frequency = replay_frequency
         self.update_buffer = update_buffer
+        self._replay_step = False
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Forward on current batch
-        outputs = model(**inputs)
-        micro_batch_size = inputs["input_ids"].shape[0]
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
 
         # Add to buffer
         if self.buffer is not None and self.update_buffer == 'online':
-            self.buffer.add_data(inputs["input_ids"], inputs["labels"], self.domain)
-      
-        # ---- Micro step count ----
-        self._micro_step += 1
-        do_replay = (self._micro_step % self.replay_frequency == 0)  # every other micro step
+            self.buffer.add_data(inputs["input_ids"], inputs["labels"], self.domain, attention_mask=inputs.get("attention_mask"))
 
-        # ---- Replay memory (half-size batch) ----
-        if do_replay and self.buffer and not self.buffer.is_empty():
-            buffer_sample_size = max(1, self.args.per_device_train_batch_size)
-            buffer_inputs, buffer_labels = self.buffer.get_data(size=buffer_sample_size)
-            replay_inputs = {"input_ids": buffer_inputs, "labels": buffer_labels}
-            replay_outputs = model(**replay_inputs)
-            loss = (outputs.loss + replay_outputs.loss) / 2
-        else:
-            loss = outputs.loss
+        if self._replay_step:
+            loss = loss / 2
 
         return (loss, outputs) if return_outputs else loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        self._micro_step += 1
+        self._replay_step = self._micro_step % self.replay_frequency == 0 and self.buffer is not None and not self.buffer.is_empty()
+        try:
+            loss = super().training_step(model, inputs, num_items_in_batch)
+        finally:
+            replay_step, self._replay_step = self._replay_step, False
+        if not replay_step:
+            return loss
+
+        replay_inputs = self.buffer.get_data(size=max(1, self.args.per_device_train_batch_size))
+        replay_inputs = {k: v.to(self.accelerator.device) for k, v in replay_inputs.items()}
+        with self.compute_loss_context_manager():
+            replay_loss = model(**replay_inputs).loss.mean()
+        replay_loss = replay_loss / self.current_gradient_accumulation_steps / 2
+        self.accelerator.backward(replay_loss)
+        return loss + replay_loss.detach()

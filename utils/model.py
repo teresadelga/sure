@@ -6,7 +6,9 @@ def prepare_model(base_model, peft_config, MODEL_NAME):
     if MODEL_NAME == "google-t5/t5-large":
         model.config.use_cache = False
     else:
-        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.enable_input_require_grads()
     model.config.dropout = 0.1
+    model.print_trainable_parameters()
     return model

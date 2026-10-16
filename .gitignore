@@ -1,0 +1,6 @@
+logs/*
+*.pyc
+
+scripts/*
+results/*
+runs/*

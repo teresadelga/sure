@@ -1,16 +1,24 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling, DataCollatorForSeq2Seq
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, TrainingArguments, Trainer, DataCollatorForSeq2Seq
 from methods.dual_learner import DualLearnerTrainer
 from methods.ewc import EWCTrainer
 from methods.replay import ReplayTrainer
-from methods.surprise_replay import SurpriseReplayTrainer
 from methods.buffer import Buffer
 from utils.model import prepare_model
-from utils.datasets import load_from_hf, prepare_datasets_llama, prepare_datasets_T5, check_prompts_labels, prepare_mlt_dataset
+from utils.datasets import load_from_hf, prepare_datasets_llama, prepare_datasets_T5, check_prompts_labels, prepare_mlt_dataset, NEMOTRON, NEMOTRON_TASKS_CONFIG, load_task_specs, load_nemotron, prepare_datasets_chat
 import torch
-from utils.evaluation import evaluate_llama, evaluate_T5
+from utils.evaluation import evaluate_llama, evaluate_T5, evaluate_chat_loss
 from utils.script import build_cfg
 from peft import LoraConfig
-from copy import deepcopy
+from datetime import datetime, timezone
+import json
+import os
+
+DEFAULT_TARGET_MODULES = {
+    "nemotron_h": (
+        r".*\.mixer\.(in_proj|q_proj|k_proj|v_proj|o_proj)"
+        r"|.*\.mixer\.shared_experts\.(up_proj|down_proj)"
+    ),
+}
 
 def resolve_dtype(x):
     if isinstance(x, torch.dtype): 
@@ -29,7 +37,9 @@ trainers = {
     'mlt': Trainer
 }
 
-def pick_evaluator(model_name: str):
+def pick_evaluator(model_name: str, benchmark: str):
+    if benchmark == NEMOTRON:
+        return evaluate_chat_loss
     if model_name.startswith("google-t5/"):
         return evaluate_T5
     if "llama" in model_name.lower() or "meta-llama" in model_name.lower():
@@ -37,8 +47,33 @@ def pick_evaluator(model_name: str):
     # safe default
     return evaluate_llama
 
+class ResultsWriter:
+    def __init__(self, path, cfg):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path):
+            raise FileExistsError(f"{path} already exists; pass a different --run_name")
+        self.path = path
+        self._write({
+            "type": "config",
+            "run_name": cfg["run_name"],
+            "model_name": cfg["model_name"],
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "config": {k: v for k, v in cfg.items() if k != "hf_token"},
+        })
+
+    def eval(self, stage, learner, task_index, task, metrics, after_task=None, after_task_name=None):
+        self._write({"type": "eval", "stage": stage, "after_task": after_task, "after_task_name": after_task_name,
+                     "learner": learner, "task_index": task_index, "task": task, **metrics,
+                     "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+
+    def _write(self, record):
+        with open(self.path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
 def main():
     cfg = build_cfg()
+    if not cfg.get("run_name"):
+        cfg["run_name"] = f"{cfg['cl_method']}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
     def get(k, default=None):
         return cfg.get(k, default)
@@ -59,7 +94,7 @@ def main():
     lora_alpha = int(get("lora_alpha", 32))
     gradient_accumulation_steps = int(get("gradient_accumulation_steps", 1))
     batch_size = int(get("batch_size", 1))
-    lambda_ema = float(get("lambda_ema", 0.999))
+    lambda_ema = get("lambda_ema") or [0.999]
     eval_after_each_task = bool(get("eval_after_each_task", False))
 
     if buffer_type:
@@ -67,7 +102,24 @@ def main():
         replay_frequency = int(get("replay_frequency", 2))
 
     DEVICE = get("device") or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    is_main = int(os.environ.get("RANK", 0)) == 0
+    if distributed and str(DEVICE).startswith("cuda"):
+        DEVICE = f"cuda:{int(os.environ['LOCAL_RANK'])}"
+        torch.cuda.set_device(DEVICE)
     print(f"Running on {DEVICE}")
+
+    task_specs = None
+    if benchmark == NEMOTRON:
+        cfg["tasks_config"] = str(get("tasks_config") or NEMOTRON_TASKS_CONFIG)
+        task_specs = cfg["task_specs"] = load_task_specs(tasks, cfg["tasks_config"])
+
+    results = None
+    if is_main:
+        results_path = os.path.join(get("results_dir") or "results", MODEL_NAME.replace("/", "_"), f"{cfg['run_name']}.jsonl")
+        results = ResultsWriter(results_path, cfg)
+        print(f"Writing results to {results_path}")
 
     if MODEL_NAME.startswith("google-t5/"):
         base_model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -91,20 +143,34 @@ def main():
     if MODEL_NAME.startswith("google-t5/"):
         data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=base_model)
     else:
-        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+        data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, label_pad_token_id=-100)
 
     peft_config = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=0.1,
         bias="none",
+        target_modules=DEFAULT_TARGET_MODULES.get(getattr(base_model.config, "model_type", None))
     )
 
     peft_config.task_type = "SEQ_2_SEQ_LM" if MODEL_NAME.startswith("google-t5/") else "CAUSAL_LM"
 
     model = prepare_model(base_model, peft_config, MODEL_NAME)
-    train_datasets_full, test_datasets = load_from_hf(tasks, benchmark)
-    train_datasets_full, train_datasets, test_datasets = prepare_datasets_T5(tokenizer, train_datasets_full, test_datasets, num_samples_training) if MODEL_NAME.startswith("google-t5") else prepare_datasets_llama(tokenizer, train_datasets_full, test_datasets)
+    task_num_samples = get("task_num_samples") or [None] * len(tasks)
+    if benchmark != NEMOTRON and any(n is not None for n in task_num_samples):
+        raise ValueError(f'Per-task sample counts ("<task>:<n>") are only supported with --benchmark={NEMOTRON}')
+    if benchmark == NEMOTRON:
+        if MODEL_NAME.startswith("google-t5"):
+            raise ValueError(f"--benchmark={NEMOTRON} needs a causal LM with a chat template")
+        train_datasets_full, test_datasets = load_nemotron(tasks, float(get("test_size", 0.05)), specs=task_specs)
+        per_task_samples = [num_samples_training if n is None else n for n in task_num_samples]
+        train_datasets_full, train_datasets, test_datasets = prepare_datasets_chat(tokenizer, train_datasets_full, test_datasets, per_task_samples, int(get("max_seq_len", 1024)), num_samples_eval)
+    elif MODEL_NAME.startswith("google-t5"):
+        train_datasets_full, test_datasets = load_from_hf(tasks, benchmark)
+        train_datasets_full, train_datasets, test_datasets = prepare_datasets_T5(tokenizer, train_datasets_full, test_datasets, num_samples_training)
+    else:
+        train_datasets_full, test_datasets = load_from_hf(tasks, benchmark)
+        train_datasets_full, train_datasets, test_datasets = prepare_datasets_llama(tokenizer, train_datasets_full, test_datasets, num_samples_training, int(get("max_seq_len", 1024)))
 
     if do_check_prompts_labels:
         # pass what your function actually needs
@@ -112,39 +178,65 @@ def main():
 
     trainer_class = trainers[cl_method]
 
-    # --- build trainer (HF vs custom) ---
+    save_steps = int(get("save_steps", 0))
+    training_args = TrainingArguments(
+        output_dir=f"./runs/{MODEL_NAME.replace('/', '_')}",
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        num_train_epochs=cfg.get("num_train_epochs", 1),
+        logging_steps=cfg.get("logging_steps", 50),
+        save_strategy="steps" if save_steps > 0 else "no",
+        save_steps=save_steps if save_steps > 0 else 500,
+        fp16=(TORCH_DTYPE == torch.float16),
+        bf16=(TORCH_DTYPE == torch.bfloat16),
+        remove_unused_columns=False,
+        report_to="none",
+        ddp_timeout=int(get("ddp_timeout", 7200)),
+    )
+
     if cl_method == 'mlt':
-        training_args = TrainingArguments(
-            output_dir=f"./runs/{MODEL_NAME.replace('/', '_')}",
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=learning_rate,
-            num_train_epochs=cfg.get("num_train_epochs", 1),
-            logging_steps=cfg.get("logging_steps", 50),
-            save_steps=cfg.get("save_steps", 0),
-            fp16=(TORCH_DTYPE == torch.float16),
-            bf16=(TORCH_DTYPE == torch.bfloat16),
-            report_to="none",
-        )
         trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=None,
             eval_dataset=None,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
             data_collator=data_collator,
         )
     else:
         trainer = trainer_class(
             model=model,
+            args=training_args,
             train_dataset=None,
             eval_dataset=None,
             data_collator=data_collator,
             update_buffer = update_buffer
         )        
 
-    evaluate = pick_evaluator(MODEL_NAME)
+    evaluate = pick_evaluator(MODEL_NAME, benchmark)
+
+    def run_eval(model, stage, learner="fast", after_task=None):
+        model.eval()
+        if is_main:
+            for j, (test_ds, test_task) in enumerate(zip(test_datasets, tasks)):
+                metrics = evaluate(model, test_ds, test_task, tokenizer, num_samples_eval, compute_ll=False)
+                results.eval(stage, learner, j, test_task, metrics, after_task,
+                             None if after_task is None else tasks[after_task])
+        trainer.accelerator.wait_for_everyone()
+        model.train()
+
+    def run_slow_evals(model, stage, after_task=None):
+        for lam in lambda_ema:
+            learner = DualLearnerTrainer.learner_name(lam, lambda_ema)
+            print(f"Results for slow learner {learner} (lambda_ema={lam})")
+            with trainer.use_slow_weights(model, lam):
+                run_eval(model, stage, learner=learner, after_task=after_task)
+
+    if get("eval_before_training", True):
+        print("--------Evaluation before training---------")
+        run_eval(model, "before_training")
 
     if cl_method == 'mlt':
         print(f'--------Training on all datasets---------')
@@ -153,10 +245,6 @@ def main():
         trainer.train_dataset = joint_ds
         trainer.train()
         model = trainer.model.to(DEVICE)
-        model.eval()
-        for test_ds, task in zip(test_datasets, tasks):
-            evaluate(model, test_ds, task, tokenizer, num_samples_eval, compute_ll=False)
-        model.train()
     else:
         buf = None
         if buffer_type is not None:
@@ -170,11 +258,10 @@ def main():
             trainer.replay_frequency = replay_frequency
             trainer.update_buffer = update_buffer
             if update_buffer == "before" and buffer_type == "Surprise":
-                buf.surprise_buffer_update(tokenizer, model, train_datasets, 0, update_buffer)
+                buf.surprise_buffer_update(tokenizer, model, train_datasets, -1, update_buffer)
 
         if cl_method == "dual_learner":
-            trainer.slow_model = deepcopy(model)
-            trainer.lambda_ema = lambda_ema
+            trainer.init_slow_weights(model, lambda_ema, debias=bool(get("ema_debias", True)))
 
         for i, task in enumerate(tasks):
             print(f'--------Training on {task}---------')
@@ -183,11 +270,11 @@ def main():
             trainer.train()
             model = trainer.model.to(DEVICE)
 
-            if eval_after_each_task:
-                model.eval()
-                for test_ds, task in zip(test_datasets, tasks):
-                    evaluate(model, test_ds, task, tokenizer, num_samples_eval, compute_ll=False)
-                model.train()
+            if eval_after_each_task and i < len(tasks) - 1:
+                print(f"--------Evaluation after {task}---------")
+                run_eval(model, "after_task", after_task=i)
+                if cl_method == "dual_learner":
+                    run_slow_evals(model, "after_task", after_task=i)
 
             if buf is not None and update_buffer in {"before", "after"} and buffer_type == "Surprise":
                 buf.surprise_buffer_update(tokenizer, model, train_datasets, i, update_buffer)
@@ -195,18 +282,22 @@ def main():
             trainer.model = model
         
 
+    if get("save_final", False):
+        final_dir = os.path.join(training_args.output_dir, cfg["run_name"], "final")
+        trainer.save_model(final_dir)
+        if is_main:
+            tokenizer.save_pretrained(final_dir)
+            print(f"Saved the final adapter to {final_dir}")
+
+    final_task = None if cl_method == 'mlt' else len(tasks) - 1
     print("--------Starting Evaluation---------")
-    model.eval()
-    for test_ds, task in zip(test_datasets, tasks):
-        evaluate(model, test_ds, task, tokenizer, num_samples_eval, compute_ll=False)
-    model.train()
+    run_eval(model, "final", after_task=final_task)
 
     if cl_method == 'dual_learner':
-        print("Results for slow learner")
-        trainer.slow_model.eval()
-        for test_ds, task in zip(test_datasets, tasks):
-            evaluate(trainer.slow_model, test_ds, task, tokenizer, num_samples_eval, compute_ll=False)
-        trainer.slow_model.train()
+        run_slow_evals(model, "final", after_task=final_task)
+
+    if is_main:
+        print(f"Results written to {results.path}")
 
 
 if __name__ == "__main__":

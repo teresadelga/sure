@@ -1,0 +1,36 @@
+# Tasks for --benchmark=nemotron
+#
+#   dataset: the Hugging Face dataset the task is drawn from
+#   domains: the parts of that dataset to train on. They are mixed into one task.
+
+
+terminal:
+  dataset: nvidia/Nemotron-Terminal-Corpus
+  domains:
+    - medium/data_processing
+    - medium/data_querying
+    - medium/data_science
+    - medium/file_operations
+    - medium/model_training
+    - medium/scientific_computing
+    - medium/security
+    - medium/system_administration
+
+swe:
+  dataset: nvidia/Nemotron-SFT-SWE-v3
+  num_shards: 4
+
+agentic_interactive:
+  dataset: nvidia/Nemotron-SFT-Agentic-v2
+  domains: [interactive_agent]
+  num_rows: 20000
+
+search:
+  dataset: nvidia/Nemotron-SFT-Agentic-v2
+  domains: [search]   # ~6k trajectories in total
+  num_rows: 20000
+
+tool_calling:
+  dataset: nvidia/Nemotron-SFT-Agentic-v2
+  domains: [tool_calling]
+  num_rows: 20000

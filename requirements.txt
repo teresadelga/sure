@@ -1,9 +1,13 @@
 torch==2.10.0
-transformers<5.0.0
+transformers==5.17.0
+accelerate>=1.10
 datasets==4.5.0
+pyyaml==6.0.3
 numpy==2.4.1
 dotenv==0.9.9
 html2text==2025.4.15
 bs4==0.0.2
 seaborn==0.13.2
-peft==0.18.1
+peft==0.21.2
+causal-conv1d
+mamba-ssm

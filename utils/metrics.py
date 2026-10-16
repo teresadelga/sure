@@ -1,9 +1,9 @@
 import re
 import torch
 
-def get_ll(text, model, tokenizer, DEVICE="cuda"):
+def get_ll(text, model, tokenizer):
     with torch.no_grad():
-        tokenized = tokenizer(text, return_tensors="pt").to(DEVICE)
+        tokenized = tokenizer(text, return_tensors="pt").to(model.device)
         labels = tokenized.input_ids
         output = model(**tokenized, labels=labels)
         avg_ll = -output.loss.item() # Loss is already averaged over tokens
