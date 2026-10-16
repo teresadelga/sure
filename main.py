@@ -66,6 +66,13 @@ class ResultsWriter:
                      "learner": learner, "task_index": task_index, "task": task, **metrics,
                      "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds")})
 
+    def checkpoint(self, stage, learner, path, base_model, base_revision, after_task=None, after_task_name=None):
+        """An adapter saved for external benchmark evaluation; the scores are appended later."""
+        self._write({"type": "checkpoint", "stage": stage, "after_task": after_task, "after_task_name": after_task_name,
+                     "learner": learner, "path": os.path.abspath(path), "base_model": base_model,
+                     "base_revision": base_revision,
+                     "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+
     def _write(self, record):
         with open(self.path, "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -97,6 +104,7 @@ def main():
     batch_size = int(get("batch_size", 1))
     lambda_ema = get("lambda_ema") or [0.999]
     eval_after_each_task = bool(get("eval_after_each_task", False))
+    eval_mode = get("eval_mode", "loss")
 
     if buffer_type:
         buffer_size = int(get("buffer_size", 500))
@@ -130,6 +138,9 @@ def main():
         base_model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME, token=HF_TOKEN, dtype=TORCH_DTYPE
         )
+
+    # The exact base weights, so benchmark checkpoints are merged onto the same revision
+    base_revision = getattr(base_model.config, "_commit_hash", None)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN)
     if tokenizer.pad_token is None:
@@ -218,13 +229,27 @@ def main():
 
     evaluate = pick_evaluator(MODEL_NAME, benchmark)
 
+    def save_eval_checkpoint(model, stage, learner, after_task):
+        label = stage if after_task is None else f"{stage}-{after_task}-{tasks[after_task]}"
+        path = os.path.join(training_args.output_dir, cfg["run_name"], "eval_checkpoints", label, learner)
+        if os.path.exists(path):
+            raise FileExistsError(f"{path} already exists; pass a different --run_name")
+        model.save_pretrained(path)
+        tokenizer.save_pretrained(path)
+        results.checkpoint(stage, learner, path, MODEL_NAME, base_revision, after_task,
+                           None if after_task is None else tasks[after_task])
+        print(f"Saved the {learner} adapter for benchmark evaluation to {path}")
+
     def run_eval(model, stage, learner="fast", after_task=None):
         model.eval()
         if is_main:
-            for j, (test_ds, test_task) in enumerate(zip(test_datasets, tasks)):
-                metrics = evaluate(model, test_ds, test_task, tokenizer, num_samples_eval, compute_ll=False)
-                results.eval(stage, learner, j, test_task, metrics, after_task,
-                             None if after_task is None else tasks[after_task])
+            if eval_mode in {"loss", "both"}:
+                for j, (test_ds, test_task) in enumerate(zip(test_datasets, tasks)):
+                    metrics = evaluate(model, test_ds, test_task, tokenizer, num_samples_eval, compute_ll=False)
+                    results.eval(stage, learner, j, test_task, metrics, after_task,
+                                 None if after_task is None else tasks[after_task])
+            if eval_mode in {"benchmarks", "both"}:
+                save_eval_checkpoint(model, stage, learner, after_task)
         trainer.accelerator.wait_for_everyone()
         model.train()
 

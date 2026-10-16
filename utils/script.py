@@ -41,6 +41,7 @@ def build_cfg():
     p.add_argument("--ema_debias", type=lambda x: str(x).lower() in {"1","true","yes"}, default=True, help="dual_learner: bias-correct the slow learners' EMA (divide by 1 - lambda^t) so no weight stays on the initial weights")
     p.add_argument("--eval_before_training", type=lambda x: str(x).lower() in {"1","true","yes"}, default=True)
     p.add_argument("--eval_after_each_task", type=lambda x: str(x).lower() in {"1","true","yes"}, default=True)
+    p.add_argument("--eval_mode", default="loss", choices=["loss", "benchmarks", "both"], help="loss: held-out slices; benchmarks: save the adapter at each eval point for external benchmark evaluation; both: do both")
 
     args = p.parse_args()
     cfg = vars(args)
