@@ -5,7 +5,7 @@ import numpy as np
 SCORE_MAX_TOKENS = 65536
 
 
-def score_sequences(model, sequences, max_tokens=SCORE_MAX_TOKENS):
+def score_sequences(model, sequences, labels=None, max_tokens=SCORE_MAX_TOKENS):
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     rank, world = (torch.distributed.get_rank(), torch.distributed.get_world_size()) if distributed else (0, 1)
     if rank == 0:
@@ -31,7 +31,10 @@ def score_sequences(model, sequences, max_tokens=SCORE_MAX_TOKENS):
             logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
             for r, k in enumerate(batch):
                 n = len(sequences[k])
-                scores[k] = F.cross_entropy(logits[r, :n - 1].float(), input_ids[r, 1:n]).item() if n > 1 else 0.0
+                targets = input_ids[r, 1:n] if labels is None else torch.as_tensor(labels[k][1:n], device=device)
+                count = int((targets != -100).sum())
+                nll = F.cross_entropy(logits[r, :n - 1].float(), targets, ignore_index=-100, reduction="sum")
+                scores[k] = nll.item() / count if count else 0.0
             del logits
     model.train(was_training)
     if distributed:
@@ -41,8 +44,9 @@ def score_sequences(model, sequences, max_tokens=SCORE_MAX_TOKENS):
     return [scores[k] for k in range(len(sequences))]
 
 class Buffer:
-    def __init__(self, data_collator, buffer_size=500, device='cuda', type="Reservoir"):
+    def __init__(self, data_collator, buffer_size=500, device='cuda', type="Reservoir", surprise_tokens="all"):
         self.buffer_size = buffer_size
+        self.surprise_tokens = surprise_tokens
         self.device = device
         self.buffer = []
         self.num_seen_examples = 0
@@ -133,7 +137,7 @@ class Buffer:
 
             if (j == i and i < 14 and update_buffer=="after") or (j == (i+1) and i < 14 and update_buffer=="before"):
                 inputs, labels = train_datasets[j]["input_ids"], train_datasets[j]["labels"]
-                scores = score_sequences(model, inputs)
+                scores = score_sequences(model, inputs, labels if self.surprise_tokens == "supervised" else None)
                 if self.is_empty():
                     num_to_add = self.buffer_size
                 elif update_buffer == "before":

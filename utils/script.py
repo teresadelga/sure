@@ -23,6 +23,7 @@ def build_cfg():
     p.add_argument("--buffer_size", type=int, default=0)
     p.add_argument("--replay_frequency", type=int, default=1)
     p.add_argument("--update_buffer", default=None, choices=[None, "before", "after"])
+    p.add_argument("--surprise_tokens", default=None, choices=["all", "supervised"], help="tokens the surprise buffer's mean NLL is over")
     p.add_argument("--compute_surprise", type=lambda x: str(x).lower() in {"1","true","yes"}, default=False)
     # misc
     p.add_argument("--hf_token", default=None)

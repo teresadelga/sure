@@ -87,6 +87,7 @@ def main():
     cl_method = cfg["cl_method"]
     update_buffer = get("update_buffer")
     buffer_type = get("buffer")
+    surprise_tokens = cfg["surprise_tokens"] = get("surprise_tokens") or ("supervised" if benchmark == NEMOTRON else "all")
     num_samples_training = get("num_samples_training")
     num_samples_eval = get("num_samples_eval")
     learning_rate = float(get("learning_rate", 2e-5))
@@ -252,7 +253,8 @@ def main():
                 buffer_size=buffer_size,
                 device=torch.device(DEVICE),
                 data_collator=data_collator,
-                type=buffer_type
+                type=buffer_type,
+                surprise_tokens=surprise_tokens
             )
             trainer.buffer = buf
             trainer.replay_frequency = replay_frequency
