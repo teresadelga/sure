@@ -27,11 +27,13 @@ NEMOTRON_TASKS_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "ne
 NEMOTRON_TERMINAL = "nvidia/Nemotron-Terminal-Corpus"
 NEMOTRON_SWE = "nvidia/Nemotron-SFT-SWE-v3"
 NEMOTRON_AGENTIC = "nvidia/Nemotron-SFT-Agentic-v2"
+NEMOTRON_SCIENCE = "nvidia/Nemotron-SFT-Science-v2"
+DEEPMATH = "zwhe99/DeepMath-103K"
 
 
 _ISSUE_TAG = re.compile(r"<(\w*(?:issue|pr_description)\w*)>(.*?)</\1>", re.S)
 
-AGENTIC_FEATURES = Features({"messages_json": Value("string"), "tools_json": Value("string"), "group": Value("string")})
+CHAT_JSON_FEATURES = Features({"messages_json": Value("string"), "tools_json": Value("string"), "group": Value("string")})
 
 
 def load_task_specs(tasks, path=NEMOTRON_TASKS_CONFIG):
@@ -121,7 +123,81 @@ def agentic_rows(split, num_rows):
 
 def load_agentic_split(split, spec, test_size, seed):
     ds = Dataset.from_generator(agentic_rows, gen_kwargs={"split": split, "num_rows": spec.get("num_rows", 20000)},
-                                features=AGENTIC_FEATURES)
+                                features=CHAT_JSON_FEATURES)
+    return split_by_group(ds, "group", test_size, seed)
+
+
+def science_rows(subsets, num_rows):
+    fs = HfFileSystem()
+    for subset in subsets:
+        with fs.open(f"datasets/{NEMOTRON_SCIENCE}/{subset}.jsonl", "rb", block_size=2**24) as f:
+            for i, line in enumerate(f):
+                if i == num_rows:
+                    break
+                row = json.loads(line)
+                messages = row["messages"]
+                question = next((m["content"] for m in messages if m["role"] == "user" and m["content"]), "")
+                if not question.strip() or not any(m["role"] == "assistant" for m in messages):
+                    continue
+                source = (row.get("metadata") or {}).get("QuestionLink")
+                key = "source:" + source if source else "question:" + " ".join(question.split())
+                tools = row.get("tools") or []
+                if isinstance(tools, str):
+                    tools = json.loads(tools)
+                yield {"messages_json": json.dumps(messages), "tools_json": json.dumps(tools),
+                       "group": hashlib.sha256(key.encode()).hexdigest()}
+
+
+def load_science(domain, spec, test_size, seed):
+    if domain is not None:
+        raise ValueError(f"{NEMOTRON_SCIENCE} uses subsets, not domains")
+    subsets = spec.get("subsets", ["syn_mcq"])
+    allowed = {"syn_mcq", "rqa", "vendor", "so"}
+    if not subsets or set(subsets) - allowed or len(set(subsets)) != len(subsets):
+        raise ValueError(f"Science subsets must be a nonempty list of distinct names from {sorted(allowed)}")
+    num_rows = spec.get("num_rows", 20000)
+    if num_rows is not None and (not isinstance(num_rows, int) or num_rows <= 0):
+        raise ValueError("Science num_rows must be a positive integer or null (all rows)")
+    ds = Dataset.from_generator(science_rows, gen_kwargs={"subsets": subsets, "num_rows": num_rows},
+                                features=CHAT_JSON_FEATURES)
+    if not len(ds):
+        raise ValueError("No usable Science conversations found in the selected subsets")
+    return split_by_group(ds, "group", test_size, seed)
+
+
+def deepmath_messages(example, solution):
+    reasoning, separator, answer = example[solution].strip().partition("</think>")
+    assistant = {"role": "assistant", "content": (answer if separator else reasoning).strip()}
+    if separator:
+        assistant["reasoning_content"] = reasoning.removeprefix("<think>").strip()
+    question = example["question"].strip()
+    return {
+        "messages": [
+            {"role": "user", "content": question + "\n\nSolve the problem step by step and put your final answer in \\boxed{}."},
+            assistant,
+        ],
+        "group": hashlib.sha256(" ".join(question.split()).encode()).hexdigest(),
+    }
+
+
+def load_deepmath(domain, spec, test_size, seed):
+    if domain is not None:
+        raise ValueError(f"{DEEPMATH} has no domains; use min_difficulty and max_difficulty")
+    solution = spec.get("solution", "r1_solution_1")
+    if solution not in {"r1_solution_1", "r1_solution_2", "r1_solution_3"}:
+        raise ValueError(f"Unknown DeepMath solution column {solution!r}")
+    lower, upper = spec.get("min_difficulty"), spec.get("max_difficulty")
+    if lower is not None and upper is not None and lower > upper:
+        raise ValueError("DeepMath min_difficulty must not exceed max_difficulty")
+    columns = ["question", "final_answer", "difficulty", "topic", solution]
+    features = Features({c: Value("float64" if c == "difficulty" else "string") for c in columns})
+    ds = load_dataset(DEEPMATH, split="train", columns=columns, features=features)
+    ds = ds.filter(lambda e: bool(e["question"] and e["question"].strip() and e[solution] and e[solution].strip())
+                   and (lower is None or e["difficulty"] >= lower)
+                   and (upper is None or e["difficulty"] <= upper))
+    if not len(ds):
+        raise ValueError("No usable DeepMath problems match the configured difficulty range")
+    ds = ds.map(lambda e: deepmath_messages(e, solution), remove_columns=[solution])
     return split_by_group(ds, "group", test_size, seed)
 
 
@@ -129,11 +205,13 @@ DOMAIN_LOADERS = {
     NEMOTRON_TERMINAL: load_terminal_domain,
     NEMOTRON_SWE: load_swe,
     NEMOTRON_AGENTIC: load_agentic_split,
+    NEMOTRON_SCIENCE: load_science,
+    DEEPMATH: load_deepmath,
 }
 
 
 def load_nemotron(tasks, test_size=0.05, seed=42, specs=None):
-    """Load the tasks of the NEMOTRON benchmark as train/test pairs, mixing each task's domains."""
+    """Load configured chat tasks as train/test pairs, mixing each task's domains."""
     specs = specs or load_task_specs(tasks)
     train_datasets_full = []
     test_datasets = []
@@ -162,9 +240,9 @@ def tokenize_chat_or_drop(example, tokenizer, max_seq_len):
 def tokenize_chat(example, tokenizer, max_seq_len):
     if "conversations" in example:  # Terminal-Corpus
         messages, tools = example["conversations"], None
-    elif "messages_json" in example:  # Agentic-v2
+    elif "messages_json" in example:  # Agentic-v2 / Science-v2
         messages, tools = tool_use_messages(json.loads(example["messages_json"])), json.loads(example["tools_json"]) or None
-    else:  # SWE-v3
+    else:  # SWE-v3 / DeepMath
         messages, tools = tool_use_messages(example["messages"]), None
 
     def render(msgs, add_generation_prompt=False):

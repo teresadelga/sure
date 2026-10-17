@@ -162,12 +162,18 @@ def main():
     else:
         data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, label_pad_token_id=-100)
 
+    model_type = getattr(base_model.config, "model_type", None)
+    target_parameters = (
+        ["mixer.experts.up_proj", "mixer.experts.down_proj"]
+        if model_type == "nemotron_h" else None
+    )
     peft_config = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha,
-        lora_dropout=0.1,
+        lora_dropout=0.0 if target_parameters else 0.1,
         bias="none",
-        target_modules=DEFAULT_TARGET_MODULES.get(getattr(base_model.config, "model_type", None))
+        target_modules=DEFAULT_TARGET_MODULES.get(model_type),
+        target_parameters=target_parameters,
     )
 
     peft_config.task_type = "SEQ_2_SEQ_LM" if MODEL_NAME.startswith("google-t5/") else "CAUSAL_LM"

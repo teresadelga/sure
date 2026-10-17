@@ -4,6 +4,17 @@
 #   domains: the parts of that dataset to train on. They are mixed into one task.
 
 
+deepmath:
+  dataset: zwhe99/DeepMath-103K
+  min_difficulty: 5
+  max_difficulty: 7
+  solution: r1_solution_1
+
+science:
+  dataset: nvidia/Nemotron-SFT-Science-v2
+  subsets: [syn_mcq]
+  num_rows: 20000
+
 terminal:
   dataset: nvidia/Nemotron-Terminal-Corpus
   domains:
