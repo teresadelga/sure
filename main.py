@@ -18,6 +18,11 @@ DEFAULT_TARGET_MODULES = {
         r".*\.mixer\.(in_proj|q_proj|k_proj|v_proj|o_proj)"
         r"|.*\.mixer\.shared_experts\.(up_proj|down_proj)"
     ),
+    "qwen3_5_text": (
+        r".*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)"
+        r"|.*\.linear_attn\.(in_proj_qkv|in_proj_z|out_proj)"
+        r"|.*\.mlp\.(gate_proj|up_proj|down_proj)"
+    ),
 }
 
 def resolve_dtype(x):
@@ -203,6 +208,15 @@ def main():
         save_steps=save_steps if save_steps > 0 else 500,
         fp16=(TORCH_DTYPE == torch.float16),
         bf16=(TORCH_DTYPE == torch.bfloat16),
+        use_liger_kernel=get("use_liger_kernel", False),
+        liger_kernel_config={
+            "rope": False,
+            "rms_norm": False,
+            "swiglu": False,
+            "cross_entropy": False,
+            "fused_linear_cross_entropy": True,
+        } if get("use_liger_kernel", False) else None,
+        ddp_find_unused_parameters=get("ddp_find_unused_parameters"),
         remove_unused_columns=False,
         report_to="none",
         ddp_timeout=int(get("ddp_timeout", 7200)),

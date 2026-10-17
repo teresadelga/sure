@@ -9,5 +9,6 @@ html2text==2025.4.15
 bs4==0.0.2
 seaborn==0.13.2
 peft==0.21.2
+liger-kernel==0.8.4
 causal-conv1d
 mamba-ssm

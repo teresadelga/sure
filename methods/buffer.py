@@ -5,6 +5,36 @@ import numpy as np
 SCORE_MAX_TOKENS = 65536
 
 
+def _score_qwen_batch(model, input_ids, attention_mask, labels=None):
+    """Project only scored tokens, without materializing sequence-by-vocabulary logits."""
+    targets = (input_ids if labels is None else labels)[:, 1:].clone()
+    targets.masked_fill_(attention_mask[:, 1:] == 0, -100)
+    valid = targets != -100
+    counts = valid.sum(dim=1)
+    if not valid.any():
+        return [0.0] * len(input_ids)
+
+    hidden = model.model(input_ids=input_ids, attention_mask=attention_mask,
+                         use_cache=False, return_dict=True).last_hidden_state
+    hidden = hidden[:, :-1][valid].contiguous()
+    head = model.get_output_embeddings()
+    weight = head.weight.detach()
+    bias = head.bias.detach() if head.bias is not None else None
+    if hidden.is_cuda:
+        from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
+        losses = LigerFusedLinearCrossEntropyLoss(reduction="none")(
+            weight, hidden, targets[valid].contiguous(), bias=bias)
+    else:
+        scored_targets = targets[valid]
+        losses = torch.cat([
+            F.cross_entropy(F.linear(chunk, weight, bias).float(), chunk_targets, reduction="none")
+            for chunk, chunk_targets in zip(hidden.split(256), scored_targets.split(256))
+        ])
+    nll = torch.zeros_like(targets, dtype=torch.float32)
+    nll[valid] = losses.float()
+    return (nll.sum(dim=1) / counts.clamp_min(1)).tolist()
+
+
 def score_sequences(model, sequences, labels=None, max_tokens=SCORE_MAX_TOKENS):
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     rank, world = (torch.distributed.get_rank(), torch.distributed.get_world_size()) if distributed else (0, 1)
@@ -15,6 +45,8 @@ def score_sequences(model, sequences, labels=None, max_tokens=SCORE_MAX_TOKENS):
     scores = {}
     was_training = model.training
     model.eval()
+    causal_lm = model.get_base_model() if hasattr(model, "get_base_model") else model
+    is_qwen = getattr(causal_lm.config, "model_type", None) == "qwen3_5_text"
     with torch.no_grad():
         start = 0
         while start < len(mine):
@@ -24,10 +56,18 @@ def score_sequences(model, sequences, labels=None, max_tokens=SCORE_MAX_TOKENS):
             start += len(batch)
             input_ids = torch.zeros(len(batch), width, dtype=torch.long)
             attention_mask = torch.zeros(len(batch), width, dtype=torch.long)
+            batch_labels = torch.full_like(input_ids, -100) if is_qwen and labels is not None else None
             for r, k in enumerate(batch):
                 input_ids[r, :len(sequences[k])] = torch.as_tensor(sequences[k])
                 attention_mask[r, :len(sequences[k])] = 1
+                if batch_labels is not None:
+                    batch_labels[r, :len(sequences[k])] = torch.as_tensor(labels[k])
             input_ids, attention_mask = input_ids.to(device), attention_mask.to(device)
+            if is_qwen:
+                batch_scores = _score_qwen_batch(causal_lm, input_ids, attention_mask,
+                                                None if batch_labels is None else batch_labels.to(device))
+                scores.update(zip(batch, batch_scores))
+                continue
             logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
             for r, k in enumerate(batch):
                 n = len(sequences[k])

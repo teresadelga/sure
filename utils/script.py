@@ -12,6 +12,8 @@ def build_cfg():
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--learning_rate", type=float, default=2e-4)
     p.add_argument("--torch_dtype", default="float16")
+    p.add_argument("--use_liger_kernel", type=lambda x: str(x).lower() in {"1","true","yes"}, default=False)
+    p.add_argument("--ddp_find_unused_parameters", type=lambda x: str(x).lower() in {"1","true","yes"}, default=None)
     p.add_argument("--num_samples_eval", type=int, default=None)
     p.add_argument("--num_samples_training", type=int, default=None)
     p.add_argument("--device", default=None)  # auto if None
